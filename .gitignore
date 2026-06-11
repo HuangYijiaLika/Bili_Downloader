@@ -1,0 +1,16 @@
+docs/
+# 凭证文件（切勿提交！）
+credentials.json
+cookie.json
+.biliapi/
+
+# 下载相关（临时文件和输出）
+temp/
+download/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
