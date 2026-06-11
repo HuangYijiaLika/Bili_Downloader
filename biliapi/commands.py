@@ -12,13 +12,23 @@ import unicodedata
 from typing import Optional, List, Dict, Any
 
 from bilibili_api import user, favorite_list, Credential
+
+from . import config
 from bilibili_api.user import BangumiType, BangumiFollowStatus
 from bilibili_api.favorite_list import FavoriteList, FavoriteListType, FavoriteListContentOrder
 
 
 def _run_async(coro):
-    """同步包装器：用 asyncio.run() 创建独立的 event loop 运行协程。"""
-    return asyncio.run(coro)
+    """同步包装器：检测 event loop 状态，选择合适的方式运行协程。"""
+    import concurrent.futures
+    try:
+        asyncio.get_running_loop()
+        # 已有运行中的 loop，在独立线程中跑
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(asyncio.run, coro).result()
+    except RuntimeError:
+        # 没有运行中的 loop，直接跑
+        return asyncio.run(coro)
 
 
 # ============================================================
@@ -472,6 +482,72 @@ def format_favorite_content(data: dict) -> str:
     return "\n".join(lines)
 
 
+import datetime as _dt
+
+
+def _fmt_ts(ts) -> str:
+    """Unix 时间戳 → 日期字符串。"""
+    if not ts:
+        return "-"
+    try:
+        return _dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError, OverflowError):
+        return str(ts)
+
+
+def format_favorite_video_detail(media: dict, number: int = 0) -> str:
+    """格式化单个收藏视频的详细信息。"""
+    lines = []
+    title = media.get("title", "未知")
+    lines.append(f"  {'='*50}")
+    lines.append(f"  [{number}] {title}")
+    lines.append(f"  {'='*50}")
+
+    # 基本信息
+    owner = media.get("upper", {})
+    owner_name = owner.get("name", "-") if isinstance(owner, dict) else "-"
+    bvid = media.get("bvid", "-")
+    lines.append(f"  UP主:     {owner_name}")
+    lines.append(f"  BV号:     {bvid}")
+
+    # 时长
+    duration = media.get("duration", "")
+    if duration:
+        lines.append(f"  时长:     {_fmt_duration(duration)}")
+    else:
+        lines.append(f"  时长:     -")
+
+    # 分集数
+    page = media.get("page", 1)
+    if page > 1:
+        lines.append(f"  分集:     {page} 集")
+
+    # 时间相关
+    fav_time = media.get("fav_time", 0)
+    ctime = media.get("ctime", 0)
+    pubtime = media.get("pubtime", 0)
+    lines.append(f"  收藏时间: {_fmt_ts(fav_time)}")
+    if ctime:
+        lines.append(f"  创建时间: {_fmt_ts(ctime)}")
+    if pubtime:
+        lines.append(f"  发布时间: {_fmt_ts(pubtime)}")
+
+    # 数据统计
+    cnt = media.get("cnt_info", {}) or {}
+    if cnt:
+        play = _fmt_num(cnt.get("play", 0))
+        collect = _fmt_num(cnt.get("collect", 0))
+        danmaku = _fmt_num(cnt.get("danmaku", 0))
+        lines.append(f"  播放: {play}  |  收藏: {collect}  |  弹幕: {danmaku}")
+
+    # 简介
+    intro = media.get("intro", "")
+    if intro:
+        lines.append(f"  简介: {intro}")
+
+    return "\n".join(lines)
+
+
 # ============================================================
 # 视频下载
 # ============================================================
@@ -506,15 +582,18 @@ def parse_video_id(raw: str) -> tuple:
 
 # 清晰度选项（名称 → VideoQuality 枚举）
 _QUALITY_OPTIONS = [
-    ("360P",  _video_mod.VideoQuality._360P),
-    ("480P",  _video_mod.VideoQuality._480P),
-    ("720P",  _video_mod.VideoQuality._720P),
-    ("1080P", _video_mod.VideoQuality._1080P),
-    ("1080P+", _video_mod.VideoQuality._1080P_PLUS),
+    ("8K",     _video_mod.VideoQuality._8K),
+    ("4K",     _video_mod.VideoQuality._4K),
     ("1080P60", _video_mod.VideoQuality._1080P_60),
-    ("4K",    _video_mod.VideoQuality._4K),
-    ("8K",    _video_mod.VideoQuality._8K),
+    ("1080P+", _video_mod.VideoQuality._1080P_PLUS),
+    ("1080P",  _video_mod.VideoQuality._1080P),
+    ("720P",   _video_mod.VideoQuality._720P),
+    ("480P",   _video_mod.VideoQuality._480P),
+    ("360P",   _video_mod.VideoQuality._360P),
 ]
+
+# 清晰度回退顺序（高→低）
+_VIDEO_QUALITY_FALLBACK = [v for _, v in _QUALITY_OPTIONS]
 
 _DEFAULT_FFMPEG = "ffmpeg"
 
@@ -589,7 +668,9 @@ def download_video(
     quality_v: int,
     quality_a: int,
     ffmpeg_path: str = _DEFAULT_FFMPEG,
+    show_progress: bool = True,
     progress_callback=None,
+    subdir: str = "",
 ) -> str:
     """下载单个视频分集，MP4 流（视频+音频分离），ffmpeg 混流。
 
@@ -597,13 +678,18 @@ def download_video(
         page_index: 分集索引（从 0 开始）
         quality_v: VideoQuality 值
         quality_a: AudioQuality 值
-        output_dir: 输出目录
         ffmpeg_path: ffmpeg 路径
         progress_callback: 进度回调 (downloaded_bytes, total_bytes) -> None
+        subdir: 输出子目录（如收藏夹名），空则直接放 download/
 
     Returns:
         输出文件路径
     """
+    if not show_progress and progress_callback is None:
+        progress_callback = lambda *a: None
+
+    max_retries = 3
+
     async def fetch():
         client = _get_client()
         kwargs = {"credential": credential}
@@ -621,36 +707,56 @@ def download_video(
 
         title = info.get("title", "未知视频")
 
-        # 获取下载链接
+        # 获取下载链接（含清晰度回退）
         dl_data = await v.get_download_url(page_index=page_index)
-        detecter = _video_mod.VideoDownloadURLDataDetecter(data=dl_data)
-        streams = detecter.detect_best_streams(
-            video_max_quality=quality_v,
-            audio_max_quality=quality_a,
-            no_dolby_audio=True,
-            no_dolby_video=True,
-            no_hdr=True,
-            no_hires=True,
-        )
+
+        # 找到用户选择清晰度在回退列表中的起始位置
+        try:
+            start_idx = _VIDEO_QUALITY_FALLBACK.index(quality_v)
+        except ValueError:
+            start_idx = len(_VIDEO_QUALITY_FALLBACK) - 1
 
         video_url = None
         audio_url = None
-        if detecter.check_video_and_audio_stream():
-            # MP4: 视频流 + 音频流 分离
-            if len(streams) >= 2:
-                video_url = streams[0].url
-                audio_url = streams[1].url
-        else:
-            # FLV: 音视频合流
-            if streams:
-                video_url = streams[0].url
-                audio_url = None
+        used_quality = None
+
+        for vq in _VIDEO_QUALITY_FALLBACK[start_idx:]:
+            detecter = _video_mod.VideoDownloadURLDataDetecter(data=dl_data)
+            streams = detecter.detect_best_streams(
+                video_max_quality=vq,
+                audio_max_quality=quality_a,
+                no_dolby_audio=True,
+                no_dolby_video=True,
+                no_hdr=True,
+                no_hires=True,
+            )
+
+            if detecter.check_video_and_audio_stream():
+                # MP4: 视频流 + 音频流 分离
+                if len(streams) >= 2:
+                    video_url = streams[0].url
+                    audio_url = streams[1].url
+                    used_quality = vq
+                    break
+            else:
+                # FLV: 音视频合流
+                if streams:
+                    video_url = streams[0].url
+                    audio_url = None
+                    used_quality = vq
+                    break
 
         if not video_url:
-            raise RuntimeError("无法获取下载链接")
+            raise RuntimeError("无法获取下载链接——所有清晰度均不可用")
 
-        # 输出目录固定为 ./download
-        download_dir = os.path.join(os.getcwd(), "download")
+        if used_quality is not None and used_quality != quality_v:
+            qname = next((n for n, v in _QUALITY_OPTIONS if v == used_quality), str(used_quality))
+            print(f"  ⚠ 所选清晰度不可用，已自动回退至 {qname}")
+
+        # 输出目录（从配置读取，可选子目录）
+        download_dir = config.get_download_dir()
+        if subdir:
+            download_dir = os.path.join(download_dir, _sanitize_filename(subdir))
         os.makedirs(download_dir, exist_ok=True)
 
         # 输出文件名
@@ -660,38 +766,67 @@ def download_video(
             basename = f"{safe_title}_P{page_index+1}_{safe_page}"
         else:
             basename = safe_title
+
         out_path = os.path.join(download_dir, f"{basename}.mp4")
 
-        # 临时目录固定为 ./temp/{av号}_{分集}/ 例如 temp/80433022_0/
+        # 临时目录（从配置读取）
         vid_aid = str(info.get("aid", aid))
-        temp_work_dir = os.path.join(os.getcwd(), "temp", f"{vid_aid}_{page_index}")
+        temp_work_dir = os.path.join(config.get_temp_dir(), f"{vid_aid}_{page_index}")
         os.makedirs(temp_work_dir, exist_ok=True)
 
         video_temp = os.path.join(temp_work_dir, "video.m4s")
         audio_temp = os.path.join(temp_work_dir, "audio.m4s")
 
-        try:
-            # 下载视频流
-            await _download_file(client, video_url, video_temp, "视频流", progress_callback)
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 下载视频流
+                await _download_file(client, video_url, video_temp, "视频流", progress_callback)
 
-            if audio_url:
-                # 下载音频流
-                await _download_file(client, audio_url, audio_temp, "音频流", progress_callback)
-                # ffmpeg 混流
-                _run_ffmpeg(ffmpeg_path, video_temp, audio_temp, out_path)
-            else:
-                # FLV 直接转换
-                await _download_file(client, video_url, video_temp, "FLV流", progress_callback)
-                _run_ffmpeg(ffmpeg_path, video_temp, None, out_path)
-        finally:
-            # 清理临时目录
-            if os.path.exists(temp_work_dir):
+                if audio_url:
+                    # 下载音频流
+                    await _download_file(client, audio_url, audio_temp, "音频流", progress_callback)
+                    # ffmpeg 混流
+                    _run_ffmpeg(ffmpeg_path, video_temp, audio_temp, out_path)
+                else:
+                    # FLV 直接转换
+                    await _download_file(client, video_url, video_temp, "FLV流", progress_callback)
+                    _run_ffmpeg(ffmpeg_path, video_temp, None, out_path)
+
+                # 成功：记录到下载记录文件
+                vid_aid_final = str(info.get("aid", aid))
+                record_path = os.path.join(download_dir, ".biliadl")
                 try:
-                    shutil.rmtree(temp_work_dir)
+                    with open(record_path, "a", encoding="utf-8") as rf:
+                        rf.write(f"{vid_aid_final}_{page_index}\n")
                 except OSError:
                     pass
 
-        return out_path
+                # 成功：清理临时目录
+                if os.path.exists(temp_work_dir):
+                    try:
+                        shutil.rmtree(temp_work_dir)
+                    except OSError:
+                        pass
+                return out_path
+
+            except Exception as e:
+                last_error = e
+                # 清理残留的临时文件
+                if os.path.exists(temp_work_dir):
+                    try:
+                        shutil.rmtree(temp_work_dir)
+                    except OSError:
+                        pass
+                os.makedirs(temp_work_dir, exist_ok=True)
+
+                if attempt < max_retries:
+                    wait_s = attempt * 2
+                    if not show_progress or progress_callback:
+                        print(f"  ⚠ 下载失败，{wait_s}s 后重试 ({attempt}/{max_retries}): {e}")
+                    await asyncio.sleep(wait_s)
+                else:
+                    raise last_error
 
     return _run_async(fetch())
 
